@@ -1,7 +1,9 @@
 import asyncio
 import time
+from asyncio import Queue
 
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, Any
 
 import aiohttp
 
@@ -16,9 +18,12 @@ requests_samples = [
 ]
 
 service_0 = "http://127.0.0.1:8000/items/get_items/"
-service_1 = 'http://127.0.0.1:8000/someservice1/'
-service_2 = 'http://127.0.0.1:8000/someservice2/'
-service_3 = 'http://127.0.0.1:8000/someservice3/'
+
+services = [
+    'http://127.0.0.1:8000/someservice1/',
+    'http://127.0.0.1:8000/someservice2/',
+    'http://127.0.0.1:8000/someservice3/',
+]
 
 
 def retry(max_attempts: int = 3, initial_delay: float = 1.0, max_delay: float = 60.0, exceptions=(Exception,)):
@@ -26,7 +31,6 @@ def retry(max_attempts: int = 3, initial_delay: float = 1.0, max_delay: float = 
         async def wrapper(*args, **kwargs):
             delay = initial_delay
             for attempt in range(1, max_attempts + 1):
-                print(attempt)
                 try:
                     return await func(*args, **kwargs)
                 except exceptions as e:
@@ -41,7 +45,7 @@ def retry(max_attempts: int = 3, initial_delay: float = 1.0, max_delay: float = 
 
 
 def generate_requests():
-    for i in range(1):
+    for i in range(2):
         requests_samples.append(('http://127.0.0.1:8000/items/get_items/', {'user_id': i}))
 
 
@@ -51,7 +55,7 @@ def business_logic(service1_response, service2_response, service3_response) -> d
 
 
 @retry(max_attempts=3)
-async def fetch_json(session: aiohttp.ClientSession, url: str, params: dict = None) -> dict:
+async def fetch_json(session: aiohttp.ClientSession, url: str, params: Optional[dict[str, Any]] = None) -> dict:
     async with session.post(url, json=params) as response:
         return await response.json()
 
@@ -62,42 +66,58 @@ async def fetch_json_get(session: aiohttp.ClientSession, url: str, item_id) -> d
         return await response.json()
 
 
-async def process_url(session, semaphore, executor, request_data):
-    async with semaphore:
-        items_response = await fetch_json(session, service_0, request_data[1])
-        item_ids = items_response['item_ids']
+class Executor:
 
-        service1_task = fetch_json_get(session, service_1, item_ids[0])
-        service2_task = fetch_json_get(session, service_2, item_ids[1])
-        service3_task = fetch_json_get(session, service_3, item_ids[2])
+    def __init__(self, urls, max_workers=10):
+        self._urls = urls
+        self._queue = Queue(max_workers)
+        self._max_workers = max_workers
+        self._results = []
+        self._session = aiohttp.ClientSession()
 
-        service1_response, service2_response, service3_response = await asyncio.gather(
-            service1_task, service2_task, service3_task
-        )
+    async def _put_queue(self):
+        for url in self._urls:
+            await self._queue.put(url)
+        await self._queue.join()
 
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            executor, business_logic, service1_response, service2_response, service3_response
-        )
+    async def execute(self):
+        tasks = [asyncio.create_task(self._work()) for _ in range(self._max_workers)]
+        tasks.append(asyncio.create_task(self._put_queue()))
 
-        return result
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+        for task in pending:
+            task.cancel()
+
+        await self._session.close()
+        return self._results
+
+    async def _work(self):
+        while True:
+            task = await self._queue.get()
+            url = task[0]
+            user_id = task[1]
+
+            ids = await fetch_json(self._session, url, user_id)
+            ids = ids['item_ids']
+
+            async with asyncio.TaskGroup() as tg:
+                srv1 = tg.create_task(fetch_json_get(self._session, services[0], ids[0]))
+                srv2 = tg.create_task(fetch_json_get(self._session, services[1], ids[1]))
+                srv3 = tg.create_task(fetch_json_get(self._session, services[2], ids[2]))
+
+            self._results.append(business_logic(srv1.result(), srv2.result(), srv3.result()))
+            self._queue.task_done()
 
 
-async def gather_data():
-    results = []
-    semaphore = asyncio.Semaphore(MAX_TASKS)
-
-    with ProcessPoolExecutor(MAX_WORKERS) as executor:
-        async with aiohttp.ClientSession() as session:
-            for i in range(0, len(requests_samples), CHUNK_SIZE):
-                chunk = requests_samples[i:i + CHUNK_SIZE]
-                tasks = [process_url(session, semaphore, executor, request_data) for request_data in chunk]
-                chunk_results = await asyncio.gather(*tasks)
-                results.extend(chunk_results)
+async def main():
+    executor = Executor(requests_samples, 1)
+    results = await executor.execute()
+    print(results)
 
 
 if __name__ == '__main__':
     generate_requests()
     start_time = time.perf_counter_ns()
-    asyncio.run(gather_data())
+    asyncio.run(main())
     print(f'Время выполнения: {time.perf_counter_ns() - start_time} сек.')
